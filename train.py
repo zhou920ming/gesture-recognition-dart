@@ -1,541 +1,423 @@
-import numpy as np
-import lightgbm as lgb
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.tensorboard import SummaryWriter
+import argparse
+import os
+from tqdm import tqdm
+import json
 from pathlib import Path
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import accuracy_score, classification_report, confusion_matrix
-import pickle
 
-def calculate_distance(point1, point2):
-    """计算两点之间的欧氏距离"""
-    return np.sqrt((point1[0] - point2[0])**2 + 
-                   (point1[1] - point2[1])**2 + 
-                   (point1[2] - point2[2])**2)
+from models.lstm_model import LSTMGestureClassifier
+from models.transformer_model import TransformerGestureClassifier
+from models.st_gcn_model import STGCNGestureClassifier
+from models.sl_gcn_model import SLGCNGestureClassifier
+from models.mlp_model import MLPGestureClassifier
+from utils.data_loader import get_dataloaders
+from utils.metrics import MetricsCalculator
 
-def calculate_angle(v1, v2):
-    """
-    计算两个向量之间的夹角（度数）
-    返回 0-180 度之间的角度
-    """
-    # 计算向量的模
-    norm1 = np.linalg.norm(v1)
-    norm2 = np.linalg.norm(v2)
-    
-    if norm1 < 1e-6 or norm2 < 1e-6:
-        return 0.0
-    
-    # 计算夹角的余弦值
-    cos_angle = np.dot(v1, v2) / (norm1 * norm2)
-    
-    # 限制在 [-1, 1] 范围内，避免数值误差
-    cos_angle = np.clip(cos_angle, -1.0, 1.0)
-    
-    # 计算角度（弧度转度数）
-    angle = np.arccos(cos_angle) * 180.0 / np.pi
-    
-    # 确保角度在 0-180 度之间
-    if angle > 180:
-        angle = 360 - angle
-    
-    return angle
 
-def extract_hand_features(mediapipe_data):
-    """
-    从63个 MediaPipe 数据提取特征
-    mediapipe_data: 63个值 (21个点 × 3个坐标)
-    返回: 45 + 36 + 48 + 10 = 139 个特征
-    """
-    # 将一维数据转换为 21x3 的点数组
-    points = mediapipe_data.reshape(21, 3)
+class Trainer:
+    """统一的训练器"""
     
-    features = []
-    
-    # ===== 特征1: 手指段的单位方向向量 (45个特征) =====
-    fingers = [
-        [0, 1, 2, 3, 4],      # 拇指
-        [0, 5, 6, 7, 8],      # 食指
-        [0, 9, 10, 11, 12],   # 中指
-        [0, 13, 14, 15, 16],  # 无名指
-        [0, 17, 18, 19, 20]   # 小指
-    ]
-    
-    for finger in fingers:
-        for i in range(1, 4):  # 3段
-            p1 = points[finger[i]]
-            p2 = points[finger[i+1]]
-            
-            dist = calculate_distance(p1, p2)
-            if dist > 0:
-                unit_vector = (p2 - p1) / dist
-                features.extend(unit_vector)
-            else:
-                features.extend([0, 0, 0])
-    
-    # ===== 特征2: 相邻手指关节差值比例 (36个特征) =====
-    cmc_indices = [1, 5, 9, 13, 17]
-    joint_groups = [
-        [2, 6, 10, 14, 18],
-        [3, 7, 11, 15, 19],
-        [4, 8, 12, 16, 20]
-    ]
-    
-    for joint_indices in joint_groups:
-        for i in range(4):
-            curr_diff = points[joint_indices[i+1]] - points[joint_indices[i]]
-            cmc_diff = points[cmc_indices[i+1]] - points[cmc_indices[i]]
-            
-            for j in range(3):
-                # 修改: 使用新的比例计算方法
-                ratio = curr_diff[j] / (abs(cmc_diff[j]) + 0.01)
-                features.append(ratio)
-    
-    # ===== 特征3: 相邻手指对应关节的单位方向向量 (48个特征) =====
-    finger_joints = [
-        [1, 2, 3, 4],      # 拇指
-        [5, 6, 7, 8],      # 食指
-        [9, 10, 11, 12],   # 中指
-        [13, 14, 15, 16],  # 无名指
-        [17, 18, 19, 20]   # 小指
-    ]
-    
-    for joint_idx in range(4):
-        for i in range(4):
-            p1 = points[finger_joints[i][joint_idx]]
-            p2 = points[finger_joints[i+1][joint_idx]]
-            
-            dist = calculate_distance(p1, p2)
-            if dist > 0:
-                unit_vector = (p2 - p1) / dist
-                features.extend(unit_vector)
-            else:
-                features.extend([0, 0, 0])
-    
-    # ===== 特征4: 相邻指节的夹角 (10个特征) =====
-    # 每根手指有2个夹角（3个关节点形成2个夹角）
-    for finger in fingers:
-        # 第一个夹角：关节1-2-3
-        v1 = points[finger[1]] - points[finger[2]]  # 向量从关节2指向关节1
-        v2 = points[finger[3]] - points[finger[2]]  # 向量从关节2指向关节3
-        angle1 = calculate_angle(v1, v2)
-        features.append(angle1)
+    def __init__(self, 
+                 model: nn.Module,
+                 train_loader,
+                 val_loader,
+                 num_classes: int,
+                 class_names: list,
+                 device: str = 'cuda',
+                 learning_rate: float = 1e-3,
+                 weight_decay: float = 1e-4,
+                 save_dir: str = './checkpoints',
+                 log_dir: str = './logs',
+                 model_name: str = 'model'):
         
-        # 第二个夹角：关节2-3-4
-        v1 = points[finger[2]] - points[finger[3]]  # 向量从关节3指向关节2
-        v2 = points[finger[4]] - points[finger[3]]  # 向量从关节3指向关节4
-        angle2 = calculate_angle(v1, v2)
-        features.append(angle2)
-    
-    return features
-
-def scan_feature_classes(feature_folder):
-    """扫描特征文件夹，获取所有类别"""
-    feature_folder = Path(feature_folder)
-    classes = []
-    
-    for feature_file in feature_folder.glob("class_*_mediapipe.txt"):
-        try:
-            filename = feature_file.stem
-            class_id = int(filename.split('_')[1])
-            classes.append(class_id)
-        except:
-            continue
-    
-    return sorted(classes)
-
-def load_features(feature_folder):
-    """加载所有类别的 MediaPipe 数据并计算特征"""
-    X = []  # 特征
-    y = []  # 标签
-    
-    feature_folder = Path(feature_folder)
-    
-    # 自动扫描所有类别
-    all_classes = scan_feature_classes(feature_folder)
-    
-    if not all_classes:
-        print("错误: 未找到任何 MediaPipe 数据文件!")
-        return None, None, None
-    
-    print(f"发现 {len(all_classes)} 个类别: {all_classes}")
-    
-    # 创建类别到索引的映射（0-based）
-    class_to_idx = {class_id: idx for idx, class_id in enumerate(all_classes)}
-    
-    for class_id in all_classes:
-        feature_file = feature_folder / f"class_{class_id}_mediapipe.txt"
+        self.model = model.to(device)
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+        self.num_classes = num_classes
+        self.class_names = class_names
+        self.device = device
+        self.model_name = model_name
         
-        if not feature_file.exists():
-            print(f"警告: 找不到文件 {feature_file}")
-            continue
+        # 优化器和损失函数
+        self.criterion = nn.CrossEntropyLoss()
+        self.optimizer = optim.Adam(
+            model.parameters(),
+            lr=learning_rate,
+            weight_decay=weight_decay
+        )
         
-        # 读取 MediaPipe 数据
-        count = 0
-        with open(feature_file, 'r') as f:
-            for line in f:
-                mediapipe_data = np.array([float(x) for x in line.strip().split()])
-                if len(mediapipe_data) == 63:  # 确保数据完整
-                    # 计算特征
-                    features = extract_hand_features(mediapipe_data)
-                    X.append(features)
-                    y.append(class_to_idx[class_id])
-                    count += 1
+        # 学习率调度器
+        self.scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            self.optimizer,
+            mode='max',
+            factor=0.5,
+            patience=10
+        )
         
-        print(f"类别 {class_id} (索引 {class_to_idx[class_id]}): 加载了 {count} 个样本")
-    
-    return np.array(X), np.array(y), class_to_idx
-
-def train_classifier(feature_folder, model_save_path="gesture_model.pkl", 
-                    use_scaler=False, boosting_type='dart'):
-    """
-    训练 LightGBM 分类器
-    
-    参数:
-        feature_folder: 特征文件夹路径
-        model_save_path: 模型保存路径
-        use_scaler: 是否使用特征归一化 (默认False)
-        boosting_type: 提升类型 'dart' 或 'gbdt' (默认'dart')
-    """
-    print("正在加载 MediaPipe 数据并计算特征...")
-    X, y, class_to_idx = load_features(feature_folder)
-    
-    if X is None or len(X) == 0:
-        print("错误: 没有加载到任何数据!")
-        return None
-    
-    num_classes = len(class_to_idx)
-    idx_to_class = {idx: class_id for class_id, idx in class_to_idx.items()}
-    
-    print(f"\n总样本数: {len(X)}")
-    print(f"特征维度: {X.shape[1]} (45 + 36 + 48 + 10 = 139)")
-    print(f"类别数量: {num_classes}")
-    print(f"标签范围: {y.min()} - {y.max()}")
-    
-    # 划分训练集和测试集
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    
-    print(f"\n训练集样本数: {len(X_train)}")
-    print(f"测试集样本数: {len(X_test)}")
-    
-    # 特征归一化 (可选)
-    scaler = None
-    if use_scaler:
-        from sklearn.preprocessing import StandardScaler
-        print("\n使用 StandardScaler 进行特征归一化...")
-        scaler = StandardScaler()
-        X_train = scaler.fit_transform(X_train)
-        X_test = scaler.transform(X_test)
-        print("✓ 特征归一化完成")
-    else:
-        print("\n未使用特征归一化")
-    
-    # 创建 LightGBM 数据集
-    train_data = lgb.Dataset(X_train, label=y_train)
-    test_data = lgb.Dataset(X_test, label=y_test, reference=train_data)
-    
-    # 设置参数
-    print(f"\n使用 boosting 类型: {boosting_type}")
-    
-    if boosting_type == 'dart':
-        params = {
-            'objective': 'multiclass',
-            'num_class': num_classes,
-            'metric': 'multi_logloss',
-            'boosting_type': 'dart',
-            'num_leaves': 31,
-            'learning_rate': 0.05,
-            'feature_fraction': 0.9,
-            'bagging_fraction': 0.8,
-            'bagging_freq': 5,
-            'verbose': 0,
-            'max_depth': -1,
-            'min_data_in_leaf': 20,
-            'drop_rate': 0.2,
-            'max_drop': 50,
-            'skip_drop': 0.5,
-            'xgboost_dart_mode': False,
-            'uniform_drop': False
+        # 保存路径
+        self.save_dir = Path(save_dir) / model_name
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # TensorBoard
+        self.writer = SummaryWriter(log_dir=f'{log_dir}/{model_name}')
+        
+        # 最佳模型追踪
+        self.best_val_acc = 0.0
+        self.best_epoch = 0
+        
+        # 训练历史
+        self.history = {
+            'train_loss': [],
+            'train_acc': [],
+            'val_loss': [],
+            'val_acc': [],
+            'learning_rate': []
         }
     
-    print(f"\n开始训练 LightGBM ({boosting_type.upper()}) 模型 ({num_classes} 个类别)...")
-    
-    # 训练模型
-    model = lgb.train(
-        params,
-        train_data,
-        num_boost_round=500,
-        valid_sets=[train_data, test_data],
-        valid_names=['train', 'test'],
-        callbacks=[
-            lgb.early_stopping(stopping_rounds=50),
-            lgb.log_evaluation(period=50)
-        ]
-    )
-    
-    # 预测
-    print("\n评估模型...")
-    y_pred_train = np.argmax(model.predict(X_train), axis=1)
-    y_pred_test = np.argmax(model.predict(X_test), axis=1)
-    
-    # 计算准确率
-    train_accuracy = accuracy_score(y_train, y_pred_train)
-    test_accuracy = accuracy_score(y_test, y_pred_test)
-    
-    print(f"\n训练集准确率: {train_accuracy:.4f}")
-    print(f"测试集准确率: {test_accuracy:.4f}")
-    
-    # 详细分类报告
-    print("\n分类报告:")
-    target_names = [f"Class {idx_to_class[i]}" for i in range(num_classes)]
-    print(classification_report(y_test, y_pred_test, 
-                                target_names=target_names,
-                                labels=list(range(num_classes))))
-    
-    # 混淆矩阵
-    print("\n混淆矩阵:")
-    cm = confusion_matrix(y_test, y_pred_test, labels=list(range(num_classes)))
-    print(cm)
-    
-    # 各类别准确率
-    print("\n各类别准确率:")
-    for i in range(num_classes):
-        if cm[i].sum() > 0:
-            acc = cm[i, i] / cm[i].sum()
-            print(f"Class {idx_to_class[i]}: {acc:.4f} ({cm[i, i]}/{cm[i].sum()})")
-    
-    # ========== 诊断检查 1: 预测概率分析 ==========
-    print("\n" + "="*60)
-    print("【诊断 1】各类别预测概率分析")
-    print("="*60)
-    y_pred_probs_test = model.predict(X_test)
-    
-    problem_classes = []
-    for i in range(num_classes):
-        class_mask = (y_test == i)
-        if class_mask.sum() > 0:
-            # 该类别样本的预测概率
-            class_probs = y_pred_probs_test[class_mask][:, i]
-            mean_prob = class_probs.mean()
-            max_prob = class_probs.max()
-            min_prob = class_probs.min()
-            
-            print(f"\n类别 {idx_to_class[i]}:")
-            print(f"  测试集样本数: {class_mask.sum()}")
-            print(f"  预测为自己的平均概率: {mean_prob:.4f}")
-            print(f"  预测为自己的最大概率: {max_prob:.4f}")
-            print(f"  预测为自己的最小概率: {min_prob:.4f}")
-            
-            # 找出该类别最常被预测成什么
-            max_prob_class = np.argmax(y_pred_probs_test[class_mask].mean(axis=0))
-            print(f"  最常被预测为: 类别 {idx_to_class[max_prob_class]}")
-            
-            # 检测问题类别
-            if max_prob < 0.3:  # 如果最大概率都小于0.3
-                problem_classes.append(idx_to_class[i])
-                print(f"  ⚠️ 警告: 该类别预测概率异常低!")
-    
-    if problem_classes:
-        print(f"\n⚠️ 发现 {len(problem_classes)} 个问题类别: {problem_classes}")
-    else:
-        print("\n✓ 所有类别预测概率正常")
-    
-    # ========== 诊断检查 2: 特征范围对比 ==========
-    print("\n" + "="*60)
-    print("【诊断 2】各类别特征范围对比")
-    print("="*60)
-    
-    # 重建 all_classes 列表
-    all_classes_sorted = sorted(class_to_idx.keys())
-    
-    print("\n检查每组特征的第一个维度:")
-    feature_groups = {
-        "特征1 (方向向量)": 0,
-        "特征2 (比例)": 45,
-        "特征3 (方向向量)": 81,
-        "特征4 (角度)": 129
-    }
-    
-    for group_name, feature_idx in feature_groups.items():
-        print(f"\n{group_name} - 特征索引 {feature_idx}:")
-        ranges = []
-        for class_id in all_classes_sorted[:min(5, len(all_classes_sorted))]:
-            class_mask = (y == class_to_idx[class_id])
-            class_features = X[class_mask, feature_idx]
-            min_val = class_features.min()
-            max_val = class_features.max()
-            ranges.append(max_val - min_val)
-            print(f"  类别 {class_id}: [{min_val:.3f}, {max_val:.3f}]")
+    def train_epoch(self, epoch: int):
+        """训练一个epoch"""
+        self.model.train()
         
-        # 检查范围差异
-        if len(ranges) > 0 and max(ranges) / (min(ranges) + 1e-6) > 100:
-            print(f"  ⚠️ 警告: 类别间特征范围差异过大! (建议使用特征归一化)")
-    
-    # ========== 诊断检查 3: 角度特征异常检测 ==========
-    print("\n" + "="*60)
-    print("【诊断 3】角度特征异常检测")
-    print("="*60)
-    
-    if X.shape[1] >= 139:
-        angle_features = X[:, 129:139]  # 最后10个特征是角度
+        running_loss = 0.0
+        correct = 0
+        total = 0
         
-        angle_issues = []
-        for i in range(10):
-            angle_col = angle_features[:, i]
-            min_angle = angle_col.min()
-            max_angle = angle_col.max()
-            mean_angle = angle_col.mean()
+        pbar = tqdm(self.train_loader, desc=f'Epoch {epoch} [Train]')
+        for batch_idx, (inputs, labels) in enumerate(pbar):
+            inputs, labels = inputs.to(self.device), labels.to(self.device)
             
-            print(f"\n角度特征 {i} (手指 {i//2}, 角度 {i%2}):")
-            print(f"  范围: [{min_angle:.1f}°, {max_angle:.1f}°]")
-            print(f"  平均: {mean_angle:.1f}°")
+            # 前向传播
+            self.optimizer.zero_grad()
+            outputs = self.model(inputs)
+            loss = self.criterion(outputs, labels)
             
-            # 检查是否有异常值（角度应该在0-180之间）
-            invalid_count = ((angle_col < 0) | (angle_col > 180)).sum()
-            if invalid_count > 0:
-                print(f"  ⚠️ 发现 {invalid_count} 个异常角度值 (不在0-180范围)!")
-                angle_issues.append(f"角度{i}有{invalid_count}个异常值")
+            # 反向传播
+            loss.backward()
+            self.optimizer.step()
             
-            # 检查是否过多为0（说明向量长度为0）
-            zero_count = (angle_col == 0).sum()
-            zero_ratio = zero_count / len(angle_col)
-            if zero_ratio > 0.5:
-                print(f"  ⚠️ {zero_count}/{len(angle_col)} ({zero_ratio:.1%}) 个样本角度为0")
-                angle_issues.append(f"角度{i}有{zero_ratio:.1%}为0")
+            # 统计
+            running_loss += loss.item()
+            _, predicted = outputs.max(1)
+            total += labels.size(0)
+            correct += predicted.eq(labels).sum().item()
+            
+            # 更新进度条
+            pbar.set_postfix({
+                'loss': running_loss / (batch_idx + 1),
+                'acc': 100. * correct / total
+            })
         
-        if angle_issues:
-            print(f"\n⚠️ 角度特征存在问题: {len(angle_issues)} 个")
+        epoch_loss = running_loss / len(self.train_loader)
+        epoch_acc = 100. * correct / total
+        
+        return epoch_loss, epoch_acc
+    
+    def validate(self, epoch: int):
+        """验证"""
+        self.model.eval()
+        
+        running_loss = 0.0
+        metrics_calc = MetricsCalculator(self.num_classes, self.class_names)
+        
+        with torch.no_grad():
+            pbar = tqdm(self.val_loader, desc=f'Epoch {epoch} [Val]')
+            for inputs, labels in pbar:
+                inputs, labels = inputs.to(self.device), labels.to(self.device)
+                
+                # 前向传播
+                outputs = self.model(inputs)
+                loss = self.criterion(outputs, labels)
+                
+                # 统计
+                running_loss += loss.item()
+                _, predicted = outputs.max(1)
+                
+                # 更新指标
+                probs = torch.softmax(outputs, dim=1)
+                metrics_calc.update(predicted, labels, probs)
+        
+        epoch_loss = running_loss / len(self.val_loader)
+        metrics = metrics_calc.compute()
+        
+        return epoch_loss, metrics, metrics_calc
+    
+    def train(self, num_epochs: int, early_stopping_patience: int = 20):
+        """完整训练流程"""
+        print(f"\n{'='*60}")
+        print(f"Training {self.model_name}")
+        print(f"{'='*60}\n")
+        
+        patience_counter = 0
+        
+        for epoch in range(1, num_epochs + 1):
+            # 训练
+            train_loss, train_acc = self.train_epoch(epoch)
+            
+            # 验证
+            val_loss, val_metrics, metrics_calc = self.validate(epoch)
+            val_acc = val_metrics['accuracy'] * 100
+            
+            # 更新学习率
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.scheduler.step(val_acc)
+            
+            # 记录历史
+            self.history['train_loss'].append(train_loss)
+            self.history['train_acc'].append(train_acc)
+            self.history['val_loss'].append(val_loss)
+            self.history['val_acc'].append(val_acc)
+            self.history['learning_rate'].append(current_lr)
+            
+            # TensorBoard记录
+            self.writer.add_scalar('Loss/train', train_loss, epoch)
+            self.writer.add_scalar('Loss/val', val_loss, epoch)
+            self.writer.add_scalar('Accuracy/train', train_acc, epoch)
+            self.writer.add_scalar('Accuracy/val', val_acc, epoch)
+            self.writer.add_scalar('Learning_rate', current_lr, epoch)
+            
+            for key, value in val_metrics.items():
+                if key.startswith(('precision', 'recall', 'f1')):
+                    self.writer.add_scalar(f'Metrics/{key}', value, epoch)
+            
+            # 打印结果
+            print(f'\nEpoch {epoch}/{num_epochs}')
+            print(f'Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}%')
+            print(f'Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%')
+            print(f'Val F1 (macro): {val_metrics["f1_macro"]:.4f}')
+            print(f'Learning Rate: {current_lr:.6f}')
+            
+            # 保存最佳模型
+            if val_acc > self.best_val_acc:
+                self.best_val_acc = val_acc
+                self.best_epoch = epoch
+                patience_counter = 0
+                
+                self.save_checkpoint(epoch, val_acc, val_metrics, is_best=True)
+                print(f'✓ Best model saved! (Val Acc: {val_acc:.2f}%)')
+                
+                # 保存混淆矩阵
+                metrics_calc.plot_confusion_matrix(
+                    save_path=self.save_dir / 'best_confusion_matrix.png'
+                )
+            else:
+                patience_counter += 1
+            
+            # Early stopping
+            if patience_counter >= early_stopping_patience:
+                print(f'\nEarly stopping triggered after {epoch} epochs')
+                break
+            
+            # 定期保存检查点
+            if epoch % 10 == 0:
+                self.save_checkpoint(epoch, val_acc, val_metrics, is_best=False)
+        
+        # 训练结束
+        print(f"\n{'='*60}")
+        print(f"Training completed!")
+        print(f"Best Val Acc: {self.best_val_acc:.2f}% at Epoch {self.best_epoch}")
+        print(f"{'='*60}\n")
+        
+        # 保存训练历史
+        self.save_history()
+        self.writer.close()
+    
+    def save_checkpoint(self, epoch: int, val_acc: float, 
+                       val_metrics: dict, is_best: bool = False):
+        """保存检查点"""
+        checkpoint = {
+            'epoch': epoch,
+            'model_state_dict': self.model.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'scheduler_state_dict': self.scheduler.state_dict(),
+            'val_acc': val_acc,
+            'val_metrics': val_metrics,
+            'history': self.history
+        }
+        
+        if is_best:
+            path = self.save_dir / 'best_model.pth'
+            torch.save(checkpoint, path)
         else:
-            print("\n✓ 所有角度特征正常")
+            path = self.save_dir / f'checkpoint_epoch_{epoch}.pth'
+            torch.save(checkpoint, path)
     
-    # ========== 诊断检查 4: 类别映射检查 ==========
-    print("\n" + "="*60)
-    print("【诊断 4】类别映射检查")
-    print("="*60)
+    def save_history(self):
+        """保存训练历史"""
+        history_path = self.save_dir / 'training_history.json'
+        with open(history_path, 'w') as f:
+            json.dump(self.history, f, indent=4)
     
-    print("\nclass_to_idx:", class_to_idx)
-    print("idx_to_class:", idx_to_class)
-    
-    # 检查映射完整性
-    assert len(class_to_idx) == len(idx_to_class), "映射长度不一致!"
-    assert set(class_to_idx.values()) == set(range(num_classes)), "索引不连续!"
-    print("\n✓ 类别映射正确")
-    
-    # ========== 诊断检查 5: 零准确率类别检测 ==========
-    print("\n" + "="*60)
-    print("【诊断 5】零准确率类别检测")
-    print("="*60)
-    
-    zero_acc_classes = []
-    for i in range(num_classes):
-        if cm[i].sum() > 0 and cm[i, i] == 0:
-            zero_acc_classes.append(idx_to_class[i])
-            print(f"\n⚠️ 类别 {idx_to_class[i]}: 测试集准确率为 0")
-            print(f"   该类别的 {cm[i].sum()} 个样本被误判为:")
-            for j in range(num_classes):
-                if cm[i, j] > 0:
-                    print(f"     类别 {idx_to_class[j]}: {cm[i, j]} 次")
-    
-    if zero_acc_classes:
-        print(f"\n⚠️ 发现 {len(zero_acc_classes)} 个零准确率类别: {zero_acc_classes}")
-    else:
-        print("\n✓ 所有类别在测试集上都有正确预测")
-    
-    # ========== 诊断检查 6: 样本数量统计 ==========
-    print("\n" + "="*60)
-    print("【诊断 6】样本数量分析")
-    print("="*60)
-    
-    sample_counts = {}
-    for class_id in class_to_idx.keys():
-        class_mask = (y == class_to_idx[class_id])
-        sample_counts[class_id] = class_mask.sum()
-    
-    min_samples = min(sample_counts.values())
-    max_samples = max(sample_counts.values())
-    min_class = [k for k, v in sample_counts.items() if v == min_samples][0]
-    max_class = [k for k, v in sample_counts.items() if v == max_samples][0]
-    
-    print(f"\n样本数量范围: {min_samples} - {max_samples}")
-    print(f"样本最少的类别: {min_class} ({min_samples} 个)")
-    print(f"样本最多的类别: {max_class} ({max_samples} 个)")
-    print(f"样本数量比: {max_samples}/{min_samples} = {max_samples/min_samples:.2f}")
-    
-    if max_samples / min_samples > 5:
-        print(f"\n⚠️ 警告: 类别不平衡严重! 建议:")
-        print("  1. 为样本少的类别增加更多训练数据")
-        print("  2. 使用类别权重平衡")
-        print("  3. 使用过采样/欠采样技术")
-    
-    # ========== 诊断总结 ==========
-    print("\n" + "="*60)
-    print("【诊断总结】")
-    print("="*60)
-    
-    issues = []
-    if problem_classes:
-        issues.append(f"预测概率异常类别: {problem_classes}")
-    if zero_acc_classes:
-        issues.append(f"零准确率类别: {zero_acc_classes}")
-    if max_samples / min_samples > 5:
-        issues.append(f"类别不平衡严重 (比例 {max_samples/min_samples:.1f}:1)")
-    
-    if issues:
-        print("\n发现以下问题:")
-        for i, issue in enumerate(issues, 1):
-            print(f"  {i}. {issue}")
-        print("\n建议:")
-        print("  - 使用特征归一化 (StandardScaler)")
-        print("  - 尝试切换到 gbdt 而不是 dart")
-        print("  - 增加问题类别的训练样本")
-        print("  - 检查问题类别的图片质量")
-    else:
-        print("\n✓ 未发现明显问题")
-    
-    # 保存模型和映射
-    print("\n" + "="*60)
-    print(f"保存模型到 {model_save_path}...")
-    print("="*60)
-    model_data = {
-        'model': model,
-        'class_to_idx': class_to_idx,
-        'idx_to_class': idx_to_class,
-        'scaler': scaler  # 保存归一化器（如果使用了）
+    def load_checkpoint(self, checkpoint_path: str):
+        """加载检查点"""
+        checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.model.load_state_dict(checkpoint['model_state_dict'])
+        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        self.history = checkpoint.get('history', self.history)
+        print(f"Loaded checkpoint from epoch {checkpoint['epoch']}")
+        return checkpoint
+
+
+def get_model(model_name: str, num_classes: int, device: str):
+    """根据名称创建模型"""
+    model_dict = {
+        'lstm': LSTMGestureClassifier(
+            input_dim=63,
+            hidden_dim=128,
+            num_layers=2,
+            num_classes=num_classes,
+            dropout=0.5,
+            bidirectional=True
+        ),
+        'transformer': TransformerGestureClassifier(
+            input_dim=63,
+            d_model=128,
+            nhead=8,
+            num_encoder_layers=4,
+            dim_feedforward=512,
+            dropout=0.1,
+            num_classes=num_classes
+        ),
+        'st_gcn': STGCNGestureClassifier(
+            in_channels=3,
+            num_classes=num_classes
+        ),
+        'sl_gcn': SLGCNGestureClassifier(
+            in_channels=3,
+            num_classes=num_classes,
+            num_subsets=3
+        ),
+        'mlp': MLPGestureClassifier(
+            input_dim=63,
+            hidden_dims=[256, 128, 64],
+            num_classes=num_classes,
+            dropout=0.5
+        )
     }
-    with open(model_save_path, 'wb') as f:
-        pickle.dump(model_data, f)
     
-    print("\n训练完成!")
+    if model_name not in model_dict:
+        raise ValueError(f"Unknown model: {model_name}. "
+                        f"Available models: {list(model_dict.keys())}")
+    
+    model = model_dict[model_name]
+    
+    # 打印模型信息
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"\n{model_name.upper()} Model:")
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    
     return model
 
-if __name__ == "__main__":
-    import sys
-    
-    feature_folder = "gesture_3"
-    model_save_path = "gesture_model.pkl"
-    
-    # 解析命令行参数
-    use_scaler = False
-    boosting_type = 'dart'
-    
-    if len(sys.argv) > 1:
-        if '--scaler' in sys.argv or '-s' in sys.argv:
-            use_scaler = True
 
-    print("="*60)
-    print("训练配置")
-    print("="*60)
-    print(f"特征文件夹: {feature_folder}")
-    print(f"模型保存路径: {model_save_path}")
-    print(f"特征归一化: {'启用' if use_scaler else '禁用'}")
-    print(f"Boosting类型: {boosting_type.upper()}")
-    print("\n使用方法:")
-    print("  python train.py              # 默认配置")
-    print("  python train.py --scaler     # 启用特征归一化")
-    print("  python train.py --gbdt       # 使用GBDT而不是DART")
-    print("  python train.py -s -g        # 同时启用两者")
-    print("="*60 + "\n")
+def main():
+    parser = argparse.ArgumentParser(description='Train gesture recognition models')
     
-    if not Path(feature_folder).exists():
-        print(f"错误: 找不到特征文件夹 '{feature_folder}'")
-    else:
-        train_classifier(feature_folder, model_save_path, use_scaler, boosting_type)
+    # 数据参数
+    parser.add_argument('--train_dir', type=str, required=True,
+                       help='Training data directory')
+    parser.add_argument('--val_dir', type=str, required=True,
+                       help='Validation data directory')
+    parser.add_argument('--test_dir', type=str, default=None,
+                       help='Test data directory (optional)')
+    
+    # 模型参数
+    parser.add_argument('--model', type=str, default='lstm',
+                       choices=['lstm', 'transformer', 'st_gcn', 'sl_gcn', 'mlp'],
+                       help='Model architecture')
+    
+    # 训练参数
+    parser.add_argument('--batch_size', type=int, default=32,
+                       help='Batch size')
+    parser.add_argument('--num_epochs', type=int, default=100,
+                       help='Number of epochs')
+    parser.add_argument('--learning_rate', type=float, default=1e-3,
+                       help='Learning rate')
+    parser.add_argument('--weight_decay', type=float, default=1e-4,
+                       help='Weight decay')
+    parser.add_argument('--early_stopping', type=int, default=20,
+                       help='Early stopping patience')
+    
+    # 其他参数
+    parser.add_argument('--num_workers', type=int, default=4,
+                       help='Number of data loading workers')
+    parser.add_argument('--device', type=str, default='cuda',
+                       choices=['cuda', 'cpu'],
+                       help='Device to use')
+    parser.add_argument('--save_dir', type=str, default='./checkpoints',
+                       help='Directory to save checkpoints')
+    parser.add_argument('--log_dir', type=str, default='./logs',
+                       help='Directory for TensorBoard logs')
+    parser.add_argument('--use_cache', action='store_true',
+                       help='Use cached preprocessed data')
+    parser.add_argument('--seed', type=int, default=42,
+                       help='Random seed')
+    
+    args = parser.parse_args()
+    
+    # 设置随机种子
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    
+    # 检查CUDA
+    if args.device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, using CPU")
+        args.device = 'cpu'
+    
+    print(f"\nUsing device: {args.device}")
+    if args.device == 'cuda':
+        print(f"GPU: {torch.cuda.get_device_name(0)}")
+    
+    # 加载数据
+    print("\nLoading data...")
+    loaders = get_dataloaders(
+        train_dir=args.train_dir,
+        val_dir=args.val_dir,
+        test_dir=args.test_dir,
+        batch_size=args.batch_size,
+        num_workers=args.num_workers,
+        use_cache=args.use_cache
+    )
+    
+    num_classes = loaders['num_classes']
+    class_names = loaders['class_names']
+    
+    print(f"Number of classes: {num_classes}")
+    print(f"Class names: {class_names}")
+    print(f"Train samples: {len(loaders['train'].dataset)}")
+    print(f"Val samples: {len(loaders['val'].dataset)}")
+    if 'test' in loaders:
+        print(f"Test samples: {len(loaders['test'].dataset)}")
+    
+    # 创建模型
+    print("\nCreating model...")
+    model = get_model(args.model, num_classes, args.device)
+    
+    # 创建训练器
+    trainer = Trainer(
+        model=model,
+        train_loader=loaders['train'],
+        val_loader=loaders['val'],
+        num_classes=num_classes,
+        class_names=class_names,
+        device=args.device,
+        learning_rate=args.learning_rate,
+        weight_decay=args.weight_decay,
+        save_dir=args.save_dir,
+        log_dir=args.log_dir,
+        model_name=args.model
+    )
+    
+    # 开始训练
+    trainer.train(
+        num_epochs=args.num_epochs,
+        early_stopping_patience=args.early_stopping
+    )
+
+
+if __name__ == '__main__':
+    main()
